@@ -39,7 +39,29 @@ jobs:
           mkdir -p out
           find .theos -maxdepth 3 -name '*.dylib' -exec cp {} out/ \;
           ls -l out
-          lipo -info out/*.dylib
+          lipo -info out/blocker.dylib
+          echo '--- blocker.dylib dependencies (LC_LOAD_DYLIB) ---'
+          otool -L out/blocker.dylib
+
+      # Optional: drop an arm64e libsubstrate.dylib in the repo root and this step
+      # verifies it + rewrites its install name to match what the host app loads
+      # (@executable_path/Frameworks/libsubstrate.dylib), then ships it alongside
+      # blocker.dylib. Without it the app aborts at launch with
+      # "incompatible architecture (have 'arm64', need 'arm64e')".
+      - name: Prepare libsubstrate
+        if: ${{ hashFiles('libsubstrate.dylib') != '' }}
+        run: |
+          set -euo pipefail
+          ARCHS=$(lipo -archs libsubstrate.dylib)
+          echo "libsubstrate.dylib archs: $ARCHS"
+          case " $ARCHS " in
+            *" arm64e "*) ;;
+            *) echo "::error::libsubstrate.dylib has no arm64e slice (found: $ARCHS). The host app is arm64e and will abort at launch."; exit 1 ;;
+          esac
+          cp libsubstrate.dylib out/libsubstrate.dylib
+          install_name_tool -id '@executable_path/Frameworks/libsubstrate.dylib' out/libsubstrate.dylib
+          echo '--- libsubstrate.dylib install name (LC_ID_DYLIB) ---'
+          otool -D out/libsubstrate.dylib
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
