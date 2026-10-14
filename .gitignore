@@ -1,0 +1,7 @@
+.theos/
+packages/
+layout/
+out/
+*.o
+*.dylib
+.DS_Store

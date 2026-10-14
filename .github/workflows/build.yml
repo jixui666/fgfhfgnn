@@ -1,0 +1,42 @@
+name: Build blocker.dylib
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      THEOS: ${{ github.workspace }}/theos
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          "$THEOS/bin/install-sdk" latest
+
+      - name: Install tools
+        run: brew install ldid
+
+      - name: Build
+        run: |
+          make clean
+          make
+
+      - name: Collect dylib
+        run: |
+          mkdir -p out
+          find .theos layout -name '*.dylib' -exec cp {} out/ \;
+          ls -l out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: blocker-dylib
+          path: out/*.dylib
+          if-no-files-found: error
