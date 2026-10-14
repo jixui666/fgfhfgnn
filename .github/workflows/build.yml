@@ -37,8 +37,9 @@ jobs:
       - name: Collect dylib
         run: |
           mkdir -p out
-          find .theos layout -name '*.dylib' -exec cp {} out/ \;
+          find .theos -maxdepth 3 -name '*.dylib' -exec cp {} out/ \;
           ls -l out
+          lipo -info out/*.dylib
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
