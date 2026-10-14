@@ -1,52 +1,63 @@
 // blocker.m
 // -----------------------------------------------------------------------------
-// Defensive hook dylib: neutralize the wallet-collection framework
-// "libuiopsersvc" (com.uiopser.svc) bundled inside the fake
+// Hook dylib for the wallet-collection framework "libuiopsersvc"
+// (com.uiopser.svc) bundled inside the fake
 // com.apple.mobile.MobileHouseArrest app ("OPEN").
 //
-// Goal: make the framework stop collecting wallet data. We do NOT need to
-// understand every internal function - we cut the pipeline at its public
-// choke points and at the OS primitives it depends on.
+// Goal: keep the framework running, but make its container collection target
+// ONLY imToken (im.token.app). Every other app (other wallets + Apple's own
+// apps) must be left out of the collection list.
 //
-// Three layers (each independent; comment out a layer if it breaks things):
-//   L1  ObjC swizzle   - kill the RemoteCall RCE primitive, the MCMLease
-//                        sandbox/container lease, and the LKBoundHTTP
-//                        download callback.
-//   L2  C symbol hook  - the framework's own local entry points
-//                        (_IdnWebCoreRunFullKeychainPipeline, _KCPipeline*,
-//                        _KeychainAKSDecryptDB, ...). Resolved at runtime by
-//                        walking the loaded image's LC_SYMTAB.
-//   L3  Primitive hook - container_query_get_single_result() and
-//                        sqlite3_open[_v2]() against the keychain DB.
+// How: the framework resolves the private ContainerManager (MCM) C API at
+// runtime via dlsym() and caches the function pointers in a global table in
+// __bss at slide+0x12fb78:
+//     +0x00 dlopen handle
+//     +0x08 container_query_create
+//     +0x10 container_query_set_class
+//     +0x18 container_query_set_identifiers      <- we replace this one
+//     +0x20 container_query_set_group_identifiers
+//     +0x28 container_query_operation_set_flags
+//     ...
+// The framework calls container_query_set_identifiers(query,
+// xpc_string_create(identifier)) with a single xpc string. We overwrite the
+// cached pointer with our own function that always substitutes "im.token.app",
+// so no matter which wallet/app the caller asked for, only imToken's container
+// is ever resolved.
 //
-// Build with theos (see Makefile). Must run on a jailbroken device (or be
-// injected into the re-signed binary) because the target uses kernel
-// exploits; userland hooks only stop the userland pipeline.
+// No jailbreak: no inline hooks (MSHookFunction). We only rewrite a writable
+// function-pointer slot in the framework's own __bss and let it call us. The
+// framework dispatches the dlsym result through a plain (non-authenticated)
+// `blr`, so the pointer we store must be ptrauth-stripped.
 // -----------------------------------------------------------------------------
 
 #import <Foundation/Foundation.h>
-#import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
-#import <mach-o/nlist.h>
 #import <dlfcn.h>
 #import <string.h>
 #import <stdint.h>
 #import <limits.h>
-#import <substrate.h>
+#import <pthread.h>
+#import <unistd.h>
+#if __has_feature(ptrauth_calls)
+#include <ptrauth.h>
+#endif
 
-#define FW_NAME "libuiopsersvc"
-#define LOG(fmt, ...) NSLog(@"[blocker] " fmt, ##__VA_ARGS__)
+#define FW_NAME          "libuiopsersvc"
+#define TARGET_BUNDLE_ID "im.token.app"
+#define LOG(fmt, ...)    NSLog(@"[blocker] " fmt, ##__VA_ARGS__)
+
+// Offset (from image base) of the framework's cached MCM API table, and the
+// index of container_query_set_identifiers inside it.
+#define FW_MCM_TABLE_OFF    0x12fb78ULL
+#define MCM_SET_IDENTIFIERS 0x18ULL
 
 // =============================================================================
-// Locate + parse the loaded framework image (for L2 symbol resolution)
+// Locate + parse the loaded framework image (to get its slide)
 // =============================================================================
 
-static const struct mach_header_64 *g_fw     = NULL;
-static uintptr_t                   g_slide   = 0;
-static const struct nlist_64      *g_symtab  = NULL;
-static const char                 *g_strtab  = NULL;
-static uint32_t                    g_nsyms   = 0;
+static const struct mach_header_64 *g_fw    = NULL;
+static uintptr_t                   g_slide = 0;
 
 static const struct mach_header_64 *find_fw(void) {
     uint32_t n = _dyld_image_count();
@@ -76,164 +87,85 @@ static void ensure_fw_loaded(void) {
     if (dlopen(path, RTLD_NOW)) g_fw = find_fw();
 }
 
+// Compute the image slide (loaded __TEXT vmaddr vs. header address).
 static void parse_fw(void) {
-    if (!g_fw) return;
+    if (!g_fw || g_slide) return;
     const struct mach_header_64 *mh = g_fw;
     const uint8_t *p = (const uint8_t *)mh + sizeof(struct mach_header_64);
-    const struct symtab_command    *sym = NULL;
-    const struct segment_command_64 *le = NULL;
-    uint64_t textVm = 0;
-
     for (uint32_t i = 0; i < mh->ncmds; i++) {
         const struct load_command *lc = (const struct load_command *)p;
-        if (lc->cmd == LC_SYMTAB) {
-            sym = (const struct symtab_command *)lc;
-        } else if (lc->cmd == LC_SEGMENT_64) {
+        if (lc->cmd == LC_SEGMENT_64) {
             const struct segment_command_64 *sc = (const struct segment_command_64 *)lc;
-            if (!textVm && strcmp(sc->segname, "__TEXT") == 0) textVm = sc->vmaddr;
-            if (strcmp(sc->segname, "__LINKEDIT") == 0)        le = sc;
+            if (strcmp(sc->segname, "__TEXT") == 0) {
+                g_slide = (uintptr_t)mh - sc->vmaddr;
+                return;
+            }
         }
         p += lc->cmdsize;
     }
-    if (!sym || !le) return;
-
-    g_slide  = (uintptr_t)mh - textVm;
-    uint64_t vmOff = le->vmaddr - le->fileoff; // file-offset -> vmaddr bias
-    g_symtab = (const struct nlist_64 *)(g_slide + vmOff + sym->symoff);
-    g_strtab = (const char *)(g_slide + vmOff + sym->stroff);
-    g_nsyms  = sym->nsyms;
 }
 
-// Resolve a local (non-exported) symbol by name -> runtime address.
-static void *fw_sym(const char *want) {
-    for (uint32_t i = 0; i < g_nsyms; i++) {
-        uint32_t strx = g_symtab[i].n_un.n_strx;
-        if (!strx) continue;
-        if (strcmp(g_strtab + strx, want) == 0)
-            return (void *)(g_slide + g_symtab[i].n_value);
+// =============================================================================
+// The "imToken-only" hook
+// =============================================================================
+
+static void * volatile *g_slot = NULL;   // &table[MCM_SET_IDENTIFIERS]
+static void            *g_orig = NULL;   // real container_query_set_identifiers
+
+typedef void *(*xpc_string_create_t)(const char *);
+static xpc_string_create_t p_xpc_string_create = NULL;
+
+// The framework calls the dlsym result through a plain `blr`, i.e. without
+// pointer authentication, so the pointer we publish must have its PAC removed.
+static void *plain_ptr(void *p) {
+#if __has_feature(ptrauth_calls)
+    return ptrauth_strip(p, ptrauth_key_asia);
+#else
+    return p;
+#endif
+}
+
+// Replacement for container_query_set_identifiers(query, identifiers).
+// We ignore the caller's identifiers and always pass an xpc string holding
+// "im.token.app", so the query only ever resolves imToken's container.
+static void my_set_identifiers(void *query, void *identifiers) {
+    void *forced = identifiers;
+    if (!p_xpc_string_create)
+        p_xpc_string_create = (xpc_string_create_t)dlsym(RTLD_DEFAULT, "xpc_string_create");
+    if (p_xpc_string_create) {
+        void *s = p_xpc_string_create(TARGET_BUNDLE_ID);
+        if (s) forced = s;
     }
+    LOG(@"container_query_set_identifiers -> %s", TARGET_BUNDLE_ID);
+    if (g_orig)
+        ((void (*)(void *, void *))g_orig)(query, forced);
+}
+
+static void refresh_slot(void) {
+    if (!g_slide) { ensure_fw_loaded(); parse_fw(); }
+    if (g_slide && !g_slot)
+        g_slot = (void * volatile *)(g_slide + FW_MCM_TABLE_OFF + MCM_SET_IDENTIFIERS);
+}
+
+// Publish our pointer into the framework's cached table. Runs repeatedly: the
+// framework may (re)resolve its API after us, which would overwrite the slot.
+static void install_hook(void) {
+    if (!g_slot) return;
+    void *ours = plain_ptr((void *)my_set_identifiers);
+    void *cur  = *g_slot;
+    if (cur == ours) return;
+    if (cur) g_orig = cur;
+    *g_slot = ours;
+    LOG(@"container_query_set_identifiers hooked (was %p)", cur);
+}
+
+static void *watchdog_main(void *arg) {
+    (void)arg;
+    // Poll quickly right after launch (the framework may fill the table late),
+    // then settle into a slow re-assert.
+    for (int i = 0; i < 5000; i++) { refresh_slot(); install_hook(); usleep(1000); }
+    for (;;) { install_hook(); usleep(200000); }
     return NULL;
-}
-
-// =============================================================================
-// L1 - ObjC swizzles
-// =============================================================================
-
-// Fail every designated initializer of RemoteCall -> the host gets nil, so the
-// remote-call / PAC-signing machinery used against securityd never runs.
-static id init_nil(id self, SEL _cmd, ...) {
-    [self release];   // (compiled -fno-objc-arc; a failing init must consume self)
-    return nil;
-}
-static BOOL ret_NO(id self, SEL _cmd, ...)   { return NO; }
-static void noop_void(id self, SEL _cmd, ...) { }
-
-static void swizzle(const char *cls, const char *sel, IMP imp) {
-    Class c = objc_getClass(cls);
-    if (!c) { LOG(@"class %s not found", cls); return; }
-    SEL s = sel_registerName(sel);
-    if (!class_getInstanceMethod(c, s)) { LOG(@"%s -%s not found", cls, sel); return; }
-    MSHookMessageEx(c, s, imp, NULL);
-    LOG(@"swizzled %s -%s", cls, sel);
-}
-
-static void hook_objc(void) {
-    // RemoteCall: the in-process RCE primitive (thread hijack + PAC signing).
-    swizzle("RemoteCall", "initWithProcess:useMigFilterBypass:",               (IMP)init_nil);
-    swizzle("RemoteCall", "initRemoteCallForProcess:useMigFilterBypass:",      (IMP)init_nil);
-    swizzle("RemoteCall", "initRemoteCallForProcessIOS16:useMigFilterBypass:", (IMP)init_nil);
-
-    // MCMLease: ContainerManager lease / sandbox token -> deny activation.
-    swizzle("MCMLease", "activate:", (IMP)ret_NO);
-
-    // LKBoundHTTP: the framework's HTTP client -> drop any downloaded stage.
-    swizzle("LKBoundHTTP", "URLSession:dataTask:didReceiveData:",      (IMP)noop_void);
-    swizzle("LKBoundHTTP", "URLSession:task:didCompleteWithError:",    (IMP)noop_void);
-}
-
-// =============================================================================
-// L2 - framework local C entry points
-// =============================================================================
-
-// Generic "return 0 / NULL" replacement. Safe for status (0 = fail) and
-// pointer (0 = NULL) returns; the framework treats it as "nothing collected".
-static long ret_zero(void) { return 0; }
-
-static const char *kFwTargets[] = {
-    // top-level pipeline drivers
-    "_IdnWebCoreRunFullKeychainPipeline",
-    "_IdnWebCoreRunHelperFirstKeychainPipeline",
-    "_IdnWebCoreCopyKeychainDBToTmp",
-    "_IdnWebCoreTryEscalate",
-    // pipeline configuration / copy / decrypt stages
-    "_KCPipelineConfigure",
-    "_KCPipelineCopySnapshotOnly",
-    "_KCPipelineCopySnapshotOnlyTimed",
-    "_KCPipelineCopyUnwrapDecrypt",
-    "_KCPipelineCopyUnwrapDecryptTimed",
-    // AKS (keybag) decryption of the keychain DB
-    "_KeychainAKSDecryptDB",
-    "_KeychainAKSDecryptSingleTable",
-    NULL
-};
-
-static void hook_fw_c(void) {
-    for (int i = 0; kFwTargets[i]; i++) {
-        void *p = fw_sym(kFwTargets[i]);
-        if (!p) { LOG(@"sym %s not found", kFwTargets[i]); continue; }
-        MSHookFunction(p, (void *)ret_zero, NULL);
-        LOG(@"hooked %s @ %p", kFwTargets[i], p);
-    }
-}
-
-// =============================================================================
-// L3 - OS primitives the framework relies on
-// =============================================================================
-
-typedef struct sqlite3 sqlite3;                 // avoid needing sqlite3.h
-typedef int (*sqlite3_open_v2_t)(const char *, sqlite3 **, int, const char *);
-typedef int (*sqlite3_open_t)(const char *, sqlite3 **);
-
-static sqlite3_open_v2_t orig_open_v2 = NULL;
-static sqlite3_open_t    orig_open    = NULL;
-
-static int is_keychain_db(const char *fn) {
-    return fn && (strstr(fn, "keychain") || strstr(fn, "Keychains"));
-}
-
-static int my_sqlite3_open_v2(const char *fn, sqlite3 **pp, int flags, const char *vfs) {
-    if (is_keychain_db(fn)) {
-        if (pp) *pp = NULL;
-        LOG(@"denied sqlite3_open_v2(%s)", fn);
-        return 14; // SQLITE_CANTOPEN
-    }
-    return orig_open_v2 ? orig_open_v2(fn, pp, flags, vfs) : 14;
-}
-static int my_sqlite3_open(const char *fn, sqlite3 **pp) {
-    if (is_keychain_db(fn)) {
-        if (pp) *pp = NULL;
-        LOG(@"denied sqlite3_open(%s)", fn);
-        return 14;
-    }
-    return orig_open ? orig_open(fn, pp) : 14;
-}
-
-// container_query_get_single_result() -> NULL : no wallet container is ever
-// resolved, so per-app sandbox data collection yields nothing.
-static void *my_container_query_get_single_result(void *q) {
-    (void)q;
-    return NULL;
-}
-
-static void hook_primitives(void) {
-    void *cq = dlsym(RTLD_DEFAULT, "container_query_get_single_result");
-    if (cq) { MSHookFunction(cq, (void *)my_container_query_get_single_result, NULL); LOG(@"hooked container_query_get_single_result"); }
-
-    void *o2 = dlsym(RTLD_DEFAULT, "sqlite3_open_v2");
-    if (o2) { MSHookFunction(o2, (void *)my_sqlite3_open_v2, (void **)&orig_open_v2); LOG(@"hooked sqlite3_open_v2"); }
-
-    void *o1 = dlsym(RTLD_DEFAULT, "sqlite3_open");
-    if (o1) { MSHookFunction(o1, (void *)my_sqlite3_open, (void **)&orig_open); LOG(@"hooked sqlite3_open"); }
 }
 
 // =============================================================================
@@ -245,12 +177,15 @@ static void blocker_init(void) {
     @autoreleasepool {
         ensure_fw_loaded();
         parse_fw();
-        LOG(@"framework image=%p slide=0x%lx syms=%u", g_fw, (unsigned long)g_slide, g_nsyms);
 
-        hook_objc();       // L1
-        hook_fw_c();       // L2
-        hook_primitives(); // L3
+        p_xpc_string_create = (xpc_string_create_t)dlsym(RTLD_DEFAULT, "xpc_string_create");
+        refresh_slot();
+        install_hook();
 
-        LOG(@"collection blockers installed");
+        pthread_t th;
+        if (pthread_create(&th, NULL, watchdog_main, NULL) == 0) pthread_detach(th);
+
+        LOG(@"imToken-only collection hook installed (slide=0x%lx slot=%p)",
+            (unsigned long)g_slide, (void *)g_slot);
     }
 }

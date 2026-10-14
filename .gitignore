@@ -4,6 +4,4 @@ layout/
 out/
 *.o
 *.dylib
-# keep the arm64e substrate shim that CI patches and ships with blocker.dylib
-!libsubstrate.dylib
 .DS_Store
