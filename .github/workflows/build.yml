@@ -18,7 +18,13 @@ jobs:
       - name: Install Theos
         run: |
           git clone --recursive https://github.com/theos/theos.git "$THEOS"
-          "$THEOS/bin/install-sdk" latest
+          # Download the SDK straight from the release asset: theos' install-sdk
+          # goes through api.github.com, which is rate-limited on CI runners.
+          curl -fL -o /tmp/iPhoneOS16.5.sdk.tar.xz \
+            https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz
+          mkdir -p "$THEOS/sdks"
+          tar -xJf /tmp/iPhoneOS16.5.sdk.tar.xz -C "$THEOS/sdks"
+          ls -d "$THEOS"/sdks/*.sdk
 
       - name: Install tools
         run: brew install ldid
